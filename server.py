@@ -1,7 +1,5 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
-import random
 
 app = FastAPI()
 
@@ -16,17 +14,15 @@ app.add_middleware(
 def root():
     return {"status": "signals-backend running"}
 
-@app.get("/signal")
-def signal(symbol: str = "XAUUSD", tf: str = "15m"):
-    directions = ["BUY", "SELL", "WAIT"]
-    direction = random.choice(directions)
-
-    return {
+@app.get("/analyze")
+def analyze(symbol: str = "XAUUSD", tf: str = "15m"):
+    signal = {
         "symbol": symbol,
         "timeframe": tf,
-        "direction": direction,
-        "entry": round(random.uniform(2300, 2400), 2),
-        "sl": round(random.uniform(2280, 2295), 2),
-        "tp": round(random.uniform(2410, 2450), 2),
-        "time": datetime.utcnow().isoformat()
+        "trend": "BUY",
+        "entry": 2034.5,
+        "stop_loss": 2028.0,
+        "take_profit": 2050.0,
+        "confidence": "78%"
     }
+    return signal
