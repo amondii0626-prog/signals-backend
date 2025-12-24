@@ -1,74 +1,96 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-import random
+from typing import List
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-SUPPORTED_SYMBOLS = [
-    "XAUUSD", "XAGUSD",
-    "BTCUSD", "ETHUSD",
-    "EURUSD", "GBPUSD", "USDJPY"
-]
-
-SUPPORTED_TF = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+SUPPORTED_SYMBOLS: List[str] = ["XAUUSD", "XAGUSD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY"]
+SUPPORTED_TIMEFRAMES: List[str] = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
 
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "message": "Signals backend is running ✅",
+        "message": "signals-backend is running ✅",
         "how_to_use": "/analyze?symbol=XAUUSD&tf=15m",
         "supported_symbols": SUPPORTED_SYMBOLS,
-        "supported_timeframes": SUPPORTED_TF
+        "supported_timeframes": SUPPORTED_TIMEFRAMES,
     }
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 @app.get("/analyze")
 def analyze(
-    symbol: str = Query(..., description="Trading symbol"),
-    tf: str = Query("15m", description="Timeframe")
+    symbol: str = Query("XAUUSD"),
+    tf: str = Query("15m"),
 ):
-    symbol = symbol.upper()
+    symbol = symbol.upper().strip()
+    tf = tf.strip()
 
     if symbol not in SUPPORTED_SYMBOLS:
-        return {"error": f"Unsupported symbol: {symbol}"}
+        return {"error": "Unsupported symbol", "supported_symbols": SUPPORTED_SYMBOLS}
 
-    if tf not in SUPPORTED_TF:
-        return {"error": f"Unsupported timeframe: {tf}"}
+    if tf not in SUPPORTED_TIMEFRAMES:
+        return {"error": "Unsupported timeframe", "supported_timeframes": SUPPORTED_TIMEFRAMES}
 
-    trend = random.choice(["BUY", "SELL"])
-
-    base_price = {
-        "XAUUSD": 2035,
-        "XAGUSD": 24.5,
-        "BTCUSD": 43000,
-        "ETHUSD": 2300,
-        "EURUSD": 1.09,
-        "GBPUSD": 1.27,
-        "USDJPY": 148
+    # ✅ Түр demo логик (дараа нь жинхэнэ анализ нэмнэ)
+    base = {
+        "XAUUSD": 2026.00,
+        "XAGUSD": 24.80,
+        "BTCUSD": 42000.0,
+        "EURUSD": 1.0900,
+        "GBPUSD": 1.2700,
+        "USDJPY": 156.00,
     }[symbol]
 
-    entry = round(base_price * random.uniform(0.995, 1.005), 2)
+    trend = "BUY" if symbol in ["BTCUSD", "EURUSD"] else "SELL"
 
-    sl = round(entry * (0.995 if trend == "BUY" else 1.005), 2)
-    tp = round(entry * (1.01 if trend == "BUY" else 0.99), 2)
+    # timeframe-аас шалтгаалж алхам өөр болгоё
+    step = {
+        "1m": 0.15,
+        "5m": 0.35,
+        "15m": 0.60,
+        "30m": 0.90,
+        "1h": 1.20,
+        "4h": 1.80,
+        "1d": 2.50,
+    }[tf]
 
-    confidence = f"{random.randint(65, 85)}%"
+    # SL/TP тооцоо (demo)
+    if symbol in ["EURUSD", "GBPUSD"]:
+        step = step / 100  # FX жижиг алхам
+    if symbol == "USDJPY":
+        step = step / 10
+
+    entry = round(base, 4)
+    if trend == "BUY":
+        stop_loss = round(entry - step * 1.6, 4)
+        take_profit = round(entry + step * 2.8, 4)
+    else:
+        stop_loss = round(entry + step * 1.6, 4)
+        take_profit = round(entry - step * 2.8, 4)
+
+    confidence = "74%"
 
     return {
         "symbol": symbol,
         "timeframe": tf,
         "trend": trend,
         "entry": entry,
-        "stop_loss": sl,
-        "take_profit": tp,
-        "confidence": confidence
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "confidence": confidence,
     }
