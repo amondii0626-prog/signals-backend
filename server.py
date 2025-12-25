@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import requests
-from typing import List, Dict, Any, Optional
+import os, time, requests
+from typing import List, Optional
 
-app = FastAPI(title="Signals Backend", version="2.0.0")
+app = FastAPI(title="Signals Backend", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,37 +14,26 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Symbol mapping (your UI symbols -> Yahoo tickers)
+# Supported symbols
 # -----------------------------
-SYMBOL_MAP = {
-    "BTCUSD": "BTC-USD",
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X",
-    # XAUUSD (Spot) шууд Yahoo дээр тогтвортой ticker олдохгүй үед:
-    # Gold futures ашиглая:
-    "XAUUSD": "GC=F",
-}
+SYMBOLS = ["XAUUSD", "BTCUSD", "EURUSD", "GBPUSD", "USDJPY"]
 
-# -----------------------------
-# Timeframe mapping (your UI tf -> Yahoo interval + range)
-# Yahoo intervals: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo
-# -----------------------------
+# Timeframes: we keep your UI set
 TF_MAP = {
-    "1m":  ("1m",  "1d"),
-    "5m":  ("5m",  "5d"),
-    "15m": ("15m", "5d"),
-    "1h":  ("60m", "1mo"),
-    "4h":  ("60m", "3mo"),   # Yahoo 4h байхгүй → 60m татаж аваад доор нь 4 цагт агрегат хийх (хялбар хувилбар: 60m дээр анализ)
-    "1d":  ("1d",  "6mo"),
+    "1m":  ("1min",  300),
+    "5m":  ("5min",  300),
+    "15m": ("15min", 500),
+    "30m": ("30min", 600),
+    "1h":  ("1h",    800),
+    "4h":  ("4h",    1200),
+    "1d":  ("1day",  1200),
 }
 
-DEFAULT_SYMBOLS = list(SYMBOL_MAP.keys())
-DEFAULT_TFS = list(TF_MAP.keys())
-
+# Twelve Data API key (Render -> Environment)
+TWELVE_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 # -----------------------------
-# Helpers: indicators
+# Indicators
 # -----------------------------
 def ema(values: List[float], period: int) -> List[Optional[float]]:
     if len(values) < period:
@@ -63,8 +52,7 @@ def rsi(values: List[float], period: int = 14) -> List[Optional[float]]:
     if len(values) < period + 1:
         return [None] * len(values)
 
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, period + 1):
         diff = values[i] - values[i - 1]
         gains.append(max(diff, 0))
@@ -74,32 +62,20 @@ def rsi(values: List[float], period: int = 14) -> List[Optional[float]]:
     avg_loss = sum(losses) / period
 
     out: List[Optional[float]] = [None] * period
-    if avg_loss == 0:
-        out.append(100.0)
-    else:
-        rs = avg_gain / avg_loss
-        out.append(100 - (100 / (1 + rs)))
+    out.append(100.0 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
 
     for i in range(period + 1, len(values)):
         diff = values[i] - values[i - 1]
         gain = max(diff, 0)
         loss = max(-diff, 0)
-
         avg_gain = (avg_gain * (period - 1) + gain) / period
         avg_loss = (avg_loss * (period - 1) + loss) / period
-
-        if avg_loss == 0:
-            out.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            out.append(100 - (100 / (1 + rs)))
-
+        out.append(100.0 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss))))
     return out
 
 def atr(high: List[float], low: List[float], close: List[float], period: int = 14) -> List[Optional[float]]:
     if len(close) < period + 1:
         return [None] * len(close)
-
     trs = []
     for i in range(1, len(close)):
         tr = max(
@@ -109,72 +85,97 @@ def atr(high: List[float], low: List[float], close: List[float], period: int = 1
         )
         trs.append(tr)
 
-    # first ATR = SMA(TR)
     out: List[Optional[float]] = [None] * period
-    first_atr = sum(trs[:period]) / period
-    out.append(first_atr)
-    prev = first_atr
-
+    first = sum(trs[:period]) / period
+    out.append(first)
+    prev = first
     for tr in trs[period:]:
         prev = (prev * (period - 1) + tr) / period
         out.append(prev)
 
-    # out length = len(close) (because trs is len-1; we aligned by padding)
-    # Ensure exact length:
     if len(out) < len(close):
-        out = out + [None] * (len(close) - len(out))
+        out += [None] * (len(close) - len(out))
     return out[:len(close)]
 
-
 # -----------------------------
-# Yahoo fetch: OHLC
+# Data fetchers
 # -----------------------------
-def fetch_yahoo_ohlc(yahoo_symbol: str, interval: str, range_: str) -> Dict[str, List[float]]:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
-    params = {
-        "interval": interval,
-        "range": range_,
-        "includePrePost": "false",
-        "events": "div,splits",
+def fetch_binance_ohlc(symbol: str, tf: str, limit: int):
+    # Binance uses symbols like BTCUSDT. We'll map BTCUSD -> BTCUSDT.
+    if symbol != "BTCUSD":
+        raise HTTPException(422, "Binance fetch only used for BTCUSD")
+    tf_to_binance = {
+        "1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"4h","1d":"1d"
     }
+    interval = tf_to_binance.get(tf)
+    if not interval:
+        raise HTTPException(422, "Unsupported tf for Binance")
+
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": "BTCUSDT", "interval": interval, "limit": min(limit, 1000)}
     r = requests.get(url, params=params, timeout=15)
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Yahoo fetch failed: {r.status_code}")
+        raise HTTPException(502, f"Binance error {r.status_code}")
+
+    j = r.json()
+    o, h, l, c = [], [], [], []
+    for k in j:
+        o.append(float(k[1])); h.append(float(k[2])); l.append(float(k[3])); c.append(float(k[4]))
+    return o, h, l, c, "Binance:BTCUSDT"
+
+def fetch_twelvedata_ohlc(symbol: str, tf: str, limit: int):
+    if not TWELVE_KEY:
+        raise HTTPException(500, "Missing TWELVE_DATA_API_KEY on server")
+
+    interval, _need = TF_MAP[tf]
+    # Twelve Data uses symbols like XAU/USD, EUR/USD, USD/JPY
+    td_symbol_map = {
+        "XAUUSD": "XAU/USD",
+        "EURUSD": "EUR/USD",
+        "GBPUSD": "GBP/USD",
+        "USDJPY": "USD/JPY",
+    }
+    td_sym = td_symbol_map.get(symbol)
+    if not td_sym:
+        raise HTTPException(422, "Unsupported symbol for Twelve Data")
+
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": td_sym,
+        "interval": interval,
+        "outputsize": min(limit, 5000),
+        "apikey": TWELVE_KEY,
+        "format": "JSON",
+    }
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code != 200:
+        raise HTTPException(502, f"TwelveData error {r.status_code}")
 
     data = r.json()
-    chart = data.get("chart", {})
-    err = chart.get("error")
-    if err:
-        raise HTTPException(status_code=502, detail=f"Yahoo error: {err}")
+    if data.get("status") == "error":
+        raise HTTPException(502, f"TwelveData: {data.get('message','error')}")
 
-    result = chart.get("result")
-    if not result:
-        raise HTTPException(status_code=502, detail="Yahoo empty result")
+    values = data.get("values") or []
+    if len(values) < 60:
+        raise HTTPException(422, "Not enough candles from Twelve Data")
 
-    res0 = result[0]
-    indicators = res0.get("indicators", {})
-    quote = (indicators.get("quote") or [{}])[0]
+    # values is newest first -> reverse
+    values = list(reversed(values))
+    o, h, l, c = [], [], [], []
+    for v in values:
+        o.append(float(v["open"]))
+        h.append(float(v["high"]))
+        l.append(float(v["low"]))
+        c.append(float(v["close"]))
+    return o, h, l, c, f"TwelveData:{td_sym}({interval})"
 
-    h = quote.get("high") or []
-    l = quote.get("low") or []
-    c = quote.get("close") or []
-    o = quote.get("open") or []
-
-    # Remove None rows (Yahoo sometimes has None)
-    high, low, close, open_ = [], [], [], []
-    for i in range(len(c)):
-        if c[i] is None or h[i] is None or l[i] is None or o[i] is None:
-            continue
-        high.append(float(h[i]))
-        low.append(float(l[i]))
-        close.append(float(c[i]))
-        open_.append(float(o[i]))
-
-    if len(close) < 60:
-        raise HTTPException(status_code=422, detail="Not enough candles from Yahoo")
-
-    return {"open": open_, "high": high, "low": low, "close": close}
-
+def fetch_ohlc(symbol: str, tf: str):
+    # choose provider per symbol
+    interval, need = TF_MAP[tf]
+    if symbol == "BTCUSD":
+        return fetch_binance_ohlc(symbol, tf, need)
+    else:
+        return fetch_twelvedata_ohlc(symbol, tf, need)
 
 # -----------------------------
 # API
@@ -189,55 +190,40 @@ def health():
 
 @app.get("/symbols")
 def symbols():
-    return {"symbols": DEFAULT_SYMBOLS}
+    return {"symbols": SYMBOLS}
 
 @app.get("/timeframes")
 def timeframes():
-    return {"timeframes": DEFAULT_TFS}
+    return {"timeframes": list(TF_MAP.keys())}
 
 @app.get("/analyze")
 def analyze(
-    symbol: str = Query("XAUUSD", description="XAUUSD, BTCUSD, EURUSD..."),
-    tf: str = Query("15m", description="1m, 5m, 15m, 1h, 4h, 1d"),
+    symbol: str = Query("XAUUSD"),
+    tf: str = Query("15m"),
 ):
     sym = symbol.upper().strip()
-    if sym not in SYMBOL_MAP:
-        raise HTTPException(status_code=422, detail=f"Unsupported symbol: {sym}")
-
+    if sym not in SYMBOLS:
+        raise HTTPException(422, f"Unsupported symbol: {sym}")
     if tf not in TF_MAP:
-        raise HTTPException(status_code=422, detail=f"Unsupported timeframe: {tf}")
+        raise HTTPException(422, f"Unsupported timeframe: {tf}")
 
-    yahoo_symbol = SYMBOL_MAP[sym]
-    interval, range_ = TF_MAP[tf]
+    o, h, l, c, source = fetch_ohlc(sym, tf)
 
-    ohlc = fetch_yahoo_ohlc(yahoo_symbol, interval, range_)
-    close = ohlc["close"]
-    high = ohlc["high"]
-    low = ohlc["low"]
+    ema50 = ema(c, 50)
+    ema200 = ema(c, 200)
+    rsi14 = rsi(c, 14)
+    atr14 = atr(h, l, c, 14)
 
-    ema50 = ema(close, 50)
-    ema200 = ema(close, 200)
-    rsi14 = rsi(close, 14)
-    atr14 = atr(high, low, close, 14)
-
-    last = len(close) - 1
-
-    e50 = ema50[last]
-    e200 = ema200[last]
-    r = rsi14[last]
-    a = atr14[last]
-
+    last = len(c) - 1
+    e50 = ema50[last]; e200 = ema200[last]; r = rsi14[last]; a = atr14[last]
     if e50 is None or e200 is None or r is None or a is None:
-        raise HTTPException(status_code=422, detail="Indicators not ready (need more candles)")
+        raise HTTPException(422, "Indicators not ready")
 
-    entry = close[last]
-
-    # Trend rule (EMA50 vs EMA200)
+    entry = c[last]
     trend = "BUY" if e50 > e200 else "SELL"
 
-    # SL/TP using ATR
     sl_mult = 1.2
-    rr = 2.0  # take profit = 2R
+    rr = 2.0
 
     if trend == "BUY":
         stop_loss = entry - a * sl_mult
@@ -246,42 +232,38 @@ def analyze(
         stop_loss = entry + a * sl_mult
         take_profit = entry - (stop_loss - entry) * rr
 
-    # Confidence scoring (simple but real)
-    # Factors:
-    # 1) EMA separation
-    # 2) RSI alignment
-    # 3) ATR (too wild -> reduce)
-    sep = abs(e50 - e200) / entry  # relative separation
-    sep_score = min(40, sep * 4000)  # scaled
-
+    # Confidence (simple)
+    sep = abs(e50 - e200) / entry
+    sep_score = min(40, sep * 4000)
     if trend == "BUY":
         rsi_score = 30 if r >= 55 else 15 if r >= 50 else 5
     else:
         rsi_score = 30 if r <= 45 else 15 if r <= 50 else 5
-
     atr_rel = a / entry
-    vol_penalty = 0
-    if atr_rel > 0.01:
-        vol_penalty = 10
-    if atr_rel > 0.02:
-        vol_penalty = 20
+    vol_penalty = 10 if atr_rel > 0.01 else 0
+    vol_penalty = 20 if atr_rel > 0.02 else vol_penalty
 
-    raw = 30 + sep_score + rsi_score - vol_penalty
-    conf = max(35, min(90, int(raw)))
+    conf = int(max(35, min(90, 30 + sep_score + rsi_score - vol_penalty)))
+
+    # decimals: gold 2dp, forex 5dp, crypto 2dp
+    if sym == "XAUUSD" or sym == "BTCUSD":
+        dp = 2
+    else:
+        dp = 5
 
     return {
         "symbol": sym,
         "timeframe": tf,
-        "source": f"Yahoo:{yahoo_symbol} ({interval}/{range_})",
+        "source": source,
         "trend": trend,
-        "entry": round(entry, 2),
-        "stop_loss": round(stop_loss, 2),
-        "take_profit": round(take_profit, 2),
+        "entry": round(entry, dp),
+        "stop_loss": round(stop_loss, dp),
+        "take_profit": round(take_profit, dp),
         "indicators": {
-            "ema50": round(e50, 2),
-            "ema200": round(e200, 2),
+            "ema50": round(e50, dp),
+            "ema200": round(e200, dp),
             "rsi14": round(r, 2),
-            "atr14": round(a, 4),
+            "atr14": round(a, 6),
         },
         "confidence": f"{conf}%",
     }
